@@ -11,6 +11,15 @@ dist/
 *.egg-info/
 *.egg
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Test / type caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Virtual environments
 venv/
 .venv/

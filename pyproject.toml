@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "env-drift"
+version = "0.1.0"
+description = "Detect cross-environment configuration drift between .env files"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [{name = "Yunaremaia", email = "yunare@gmail.com"}]
+keywords = [
+    "cli",
+    "config-management",
+    "dotenv",
+    "drift-detection",
+    "environment-variables",
+    "devops",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+env-drift = "env_drift.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yunaremaia/env-drift"
+Issues = "https://github.com/yunaremaia/env-drift/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
