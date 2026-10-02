@@ -35,6 +35,21 @@ All notable changes to this project will be documented in this file.
 
 - Masking keys off the variable name rather than the environment name, which
   leaked `SECRET_KEY` values in text and JSON output
+- `pending_removal` is no longer skipped once a key is live in two or more
+  environments. The check sat behind `len(defined_in) < 2`, so the
+  three-environment case the README documents (a key live in development and
+  staging, commented out in production) reported only the weaker
+  `missing_key_in_env` and lost the actionable "the removal was started but
+  never finished" finding
+- A `.env-driftignore` that is not valid UTF-8 is now reported as a
+  configuration error (exit 2) instead of escaping as a raw traceback. The
+  decode error is not an `OSError`, and the resulting exit 1 is documented as
+  "drift detected", so a corrupted ignore file failed CI for the wrong reason
+- SARIF `artifactLocation.uri` is now relative to the scanned root and points
+  at the env file that drifted. Every location used to carry the resolved root
+  directory as an absolute path, which both landed every alert on the repo root
+  and contradicted `uriBaseId: "%SRCROOT%"`. A finding with no file behind it
+  is rendered without a location rather than with a fabricated one
 
 ## [Initial Release]
 

@@ -7,14 +7,19 @@ green proved nothing about them.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
 import pytest
 
+from env_drift.config import Config, ConfigError, load_config
+from env_drift.discovery import discover_env_files
 from env_drift.expand import expand_all
 from env_drift.masking import REDACTED, mask_value
 from env_drift.parser import parse_text
+from env_drift.report import render_sarif
+from env_drift.scanner import EnvSnapshot, load_snapshots, scan
 
 # --- parser: a quoted value followed by a trailing comment -----------------
 
@@ -94,9 +99,6 @@ def test_escaped_dollar_resolves_to_a_literal_dollar_sign():
 
 def test_scanner_expands_hand_built_snapshots_exactly_once():
     """Snapshots built by hand still resolve references, and only once."""
-    from env_drift.config import Config
-    from env_drift.scanner import EnvSnapshot, scan
-
     snapshots = [
         EnvSnapshot(name="development", values={"LITERAL": r"\$HOME", "HOME": "/root"}),
         EnvSnapshot(name="production", values={"LITERAL": r"\$HOME", "HOME": "/other"}),
@@ -177,3 +179,132 @@ def test_diff_rejects_an_ambiguous_environment_name(tmp_path):
     # caller silently got a diff of a file they never named.
     assert result.returncode == 2
     assert "ambiguous" in (result.stderr + result.stdout).lower()
+
+
+# --- pending_removal must survive a third environment ----------------------
+
+
+def test_pending_removal_is_reported_with_three_environments():
+    """The 3-environment case the README documents.
+
+    ``LEGACY`` is live in development and staging and commented out in
+    production. The pending-removal check was gated behind
+    ``len(defined_in) < 2``, so as soon as a key was live in *two* environments
+    the check was skipped and only the weaker ``missing_key_in_env`` finding
+    survived -- the actionable fact, that the removal was started but never
+    finished, was lost exactly when there were more environments to compare.
+    """
+    development = EnvSnapshot("development", {"A": "1", "LEGACY": "1"}, ())
+    staging = EnvSnapshot("staging", {"A": "1", "LEGACY": "1"}, ())
+    production = EnvSnapshot("production", {"A": "1"}, ("LEGACY",))
+
+    found = [
+        d for d in scan([development, staging, production], Config())
+        if d.drift_type == "pending_removal"
+    ]
+    assert [d.key for d in found] == ["LEGACY"]
+    assert found[0].severity == "warning"
+    assert "production" in found[0].message
+    assert "development" in found[0].message
+
+
+def test_pending_removal_still_absent_when_the_key_is_live_in_every_env():
+    """The other side of the guard: a key that is live everywhere is not
+    pending removal, however many environments there are."""
+    snapshots = [
+        EnvSnapshot("development", {"A": "1"}, ()),
+        EnvSnapshot("staging", {"A": "1"}, ()),
+        EnvSnapshot("production", {"A": "1"}, ()),
+    ]
+    assert [d for d in scan(snapshots, Config()) if d.drift_type == "pending_removal"] == []
+
+
+def test_pending_removal_survives_the_cli_with_three_environments(tmp_path):
+    """End-to-end, so the finding cannot be lost between scanner and report."""
+    (tmp_path / ".env.development").write_text("A=1\nLEGACY=1\n", encoding="utf-8")
+    (tmp_path / ".env.staging").write_text("A=1\nLEGACY=1\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n#LEGACY=1\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "env_drift", "scan", "--format", "json"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    payload = json.loads(result.stdout)
+    assert "pending_removal" in payload["summary"]["by_type"]
+
+
+# --- a corrupted ignore file is a config error, not drift -------------------
+
+
+def test_undecodable_ignore_file_is_a_config_error_not_drift(tmp_path):
+    """`.env-driftignore` that is not valid UTF-8 must exit 2.
+
+    A traceback here exits 1, which the CLI documents as "drift detected": CI
+    would go red over a broken ignore file and red for the wrong reason, and
+    the drift it never reported would be invisible.
+    """
+    (tmp_path / ".env.development").write_text("A=1\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n", encoding="utf-8")
+    (tmp_path / ".env-driftignore").write_bytes(b"LEGACY_\xff\xfe\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "env_drift", "scan"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "UnicodeDecodeError" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_load_config_rejects_an_undecodable_ignore_file(tmp_path):
+    (tmp_path / ".env-driftignore").write_bytes(b"LEGACY_\xff\xfe\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+# --- SARIF locations must point at the file that drifted -------------------
+
+
+def test_sarif_uri_is_repo_relative_and_names_the_drifting_file(tmp_path):
+    """Code scanning resolves ``uri`` against ``uriBaseId`` (``%SRCROOT%``).
+
+    Every location used to carry the resolved root directory as an absolute
+    path, so every alert landed on the repo root instead of the env file that
+    actually drifted, and the absolute prefix defeated the base id entirely.
+    """
+    (tmp_path / ".env.development").write_text("A=1\nONLY_DEV=x\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n", encoding="utf-8")
+    files = discover_env_files(tmp_path)
+    drifts = scan(load_snapshots(files), Config())
+
+    document = json.loads(render_sarif(drifts, environments=[f.name for f in files], root=tmp_path))
+    results = document["runs"][0]["results"]
+    assert results
+    for result in results:
+        location = result["locations"][0]["physicalLocation"]["artifactLocation"]
+        uri = location["uri"]
+        assert not uri.startswith("/"), f"SARIF uri must be repo-relative, got {uri!r}"
+        assert uri == ".env.development", f"expected the drifting file, got {uri!r}"
+
+
+def test_sarif_uri_of_a_nested_env_file_is_relative_to_the_root(tmp_path):
+    """A file in a subdirectory keeps its directory prefix, minus the root."""
+    (tmp_path / "services" / "api").mkdir(parents=True)
+    (tmp_path / "services" / "api" / ".env.development").write_text("A=1\nONLY=x\n", encoding="utf-8")
+    (tmp_path / "services" / "api" / ".env.production").write_text("A=1\n", encoding="utf-8")
+    files = discover_env_files(tmp_path)
+    drifts = scan(load_snapshots(files), Config())
+
+    document = json.loads(render_sarif(drifts, environments=[f.name for f in files], root=tmp_path))
+    uris = {
+        r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for r in document["runs"][0]["results"]
+    }
+    assert uris == {"services/api/.env.development"}
+    for uri in uris:
+        assert not uri.startswith("/")
+        assert str(tmp_path) not in uri

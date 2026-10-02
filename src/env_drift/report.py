@@ -5,8 +5,9 @@ before anything is serialised. Masking is applied *before* the format is
 rendered, not inside each renderer, so a new output format cannot accidentally
 skip it -- the leak path this project exists to close.
 
-``root`` is the scanned directory; it anchors SARIF artifact locations so
-GitHub code scanning can link a result back to a file.
+``root`` is the scanned directory. In SARIF it is the base that every
+``artifactLocation.uri`` is made relative to (see ``uriBaseId`` ``%SRCROOT%``),
+so an alert points at the env file that drifted and not at the root.
 """
 
 from __future__ import annotations
@@ -147,13 +148,43 @@ def render_json(
     return json.dumps(build_payload(drifts, environments, root, mask), indent=2) + "\n"
 
 
+def _artifact_uri(path: Path | None, root_path: Path) -> str | None:
+    """A repo-relative SARIF uri for ``path``, or ``None`` if it has none.
+
+    SARIF ``uri`` is resolved against ``uriBaseId`` (``%SRCROOT%`` here), so it
+    must be relative to the scan root -- an absolute path is not merely
+    redundant, it points outside the checkout and code scanning cannot link it.
+    ``as_posix`` is required because a URI always uses forward slashes, even
+    when the scan runs on Windows.
+
+    Returns ``None`` for a finding with no file behind it (a hand-built
+    :class:`~env_drift.scanner.EnvDrift`), which is rendered without a location
+    rather than with a fabricated one.
+    """
+    if path is None:
+        return None
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(root_path)
+    except ValueError:
+        # The file lies outside the scanned root, so there is no relative uri
+        # that means anything to a consumer resolving against %SRCROOT%.
+        return None
+    return relative.as_posix()
+
+
 def render_sarif(
     drifts: list[EnvDrift],
     environments: list[str] | None = None,
     root: str | Path = ".",
     mask: bool = True,
 ) -> str:
-    """SARIF 2.1.0 for GitHub code scanning."""
+    """SARIF 2.1.0 for GitHub code scanning.
+
+    Each result points at the env file that actually drifted
+    (:attr:`~env_drift.scanner.EnvDrift.path`, relative to ``root``), so a
+    code-scanning alert opens the offending file instead of the repo root.
+    """
     safe = _safe_environments(drifts, mask=mask)
     root_path = Path(root).resolve()
 
@@ -168,26 +199,24 @@ def render_sarif(
     ]
 
     results: list[dict[str, Any]] = []
-    for item in safe:
-        results.append(
-            {
-                "ruleId": item["drift_type"],
-                "level": item["severity"],
-                "message": {"text": item["message"]},
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {
-                                "uri": str(root_path),
-                                "uriBaseId": "%SRCROOT%",
-                            },
-                            "region": {"startLine": 1},
-                        }
+    for drift, item in zip(drifts, safe, strict=True):
+        result: dict[str, Any] = {
+            "ruleId": item["drift_type"],
+            "level": item["severity"],
+            "message": {"text": item["message"]},
+            "properties": {"key": item["key"], "environments": item["environments"]},
+        }
+        uri = _artifact_uri(drift.path, root_path)
+        if uri is not None:
+            result["locations"] = [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": uri, "uriBaseId": "%SRCROOT%"},
+                        "region": {"startLine": 1},
                     }
-                ],
-                "properties": {"key": item["key"], "environments": item["environments"]},
-            }
-        )
+                }
+            ]
+        results.append(result)
 
     document = {
         "$schema": _SARIF_SCHEMA,

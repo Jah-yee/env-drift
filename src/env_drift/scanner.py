@@ -22,6 +22,9 @@ reported for these checks:
     The key resolves to an empty string where another environment has a value.
 ``pending_removal``
     The key is commented out in one environment but still live in another.
+
+Each finding carries the env file it is anchored to (:attr:`EnvDrift.path`) so
+that :func:`env_drift.report.render_sarif` can report a repo-relative location.
 """
 
 from __future__ import annotations
@@ -68,6 +71,12 @@ class EnvDrift:
     severity: str
     message: str
     environments: dict[str, str | None] = field(default_factory=dict)
+    #: The env file this finding is anchored to, when the scan came from real
+    #: files. :func:`env_drift.report.render_sarif` turns it into a
+    #: repo-relative ``artifactLocation.uri`` so code scanning points at the
+    #: file that drifted instead of at the scan root. ``None`` for a finding
+    #: built by hand, which has no file behind it.
+    path: Path | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -130,7 +139,27 @@ def _casing_inconsistent(values_by_env, defined_in, key):
     return all(shape_of(literal) == "boolean" for literal in literals)
 
 
-def _pending_removal(key, snapshots, values_by_env, defined_in, present):
+def _anchor_path(snapshots, defined_in):
+    """The file a finding about this key should be reported against.
+
+    The first environment that actually defines the key wins, so a SARIF
+    alert lands on the env file carrying the live value rather than on the
+    scan root. A required key that no environment declares has no defining
+    file, so the first snapshot is used instead; a hand-built finding with no
+    snapshots at all has no path to point at.
+    """
+    by_name = {s.name: s.path for s in snapshots}
+    for name in defined_in:
+        path = by_name.get(name)
+        if path is not None:
+            return Path(path)
+    for snapshot in snapshots:
+        if snapshot.path is not None:
+            return Path(snapshot.path)
+    return None
+
+
+def _pending_removal(key, snapshots, values_by_env, defined_in, present, path=None):
     commented_in = [
         s.name for s in snapshots if key in s.commented_keys and key not in values_by_env[s.name]
     ]
@@ -145,10 +174,11 @@ def _pending_removal(key, snapshots, values_by_env, defined_in, present):
             f"{', '.join(defined_in)}"
         ),
         environments=present,
+        path=path,
     )
 
 
-def _presence_check(key, defined_in, absent_in, present, required):
+def _presence_check(key, defined_in, absent_in, present, required, path=None):
     """Report absence of a key: orphaned (one env) or missing (some envs)."""
     if absent_in and not defined_in:
         return EnvDrift(
@@ -160,6 +190,7 @@ def _presence_check(key, defined_in, absent_in, present, required):
                 f"({', '.join(absent_in)})"
             ),
             environments=present,
+            path=path,
         )
     if absent_in and len(defined_in) == 1:
         # Present in exactly one environment: both "missing elsewhere" and
@@ -173,6 +204,7 @@ def _presence_check(key, defined_in, absent_in, present, required):
                 f"({', '.join(absent_in)})"
             ),
             environments=present,
+            path=path,
         )
     if absent_in:
         return EnvDrift(
@@ -184,11 +216,12 @@ def _presence_check(key, defined_in, absent_in, present, required):
                 f"{', '.join(absent_in)}"
             ),
             environments=present,
+            path=path,
         )
     return None
 
 
-def _value_check(key, values_by_env, defined_in, present, config):
+def _value_check(key, values_by_env, defined_in, present, config, path=None):
     """Compare values across environments for shared keys, shapes and empties."""
     findings = []
     distinct = {values_by_env[name][key] for name in defined_in}
@@ -204,6 +237,7 @@ def _value_check(key, values_by_env, defined_in, present, config):
                     f"environments ({', '.join(defined_in)})"
                 ),
                 environments=present,
+                path=path,
             )
         ]
 
@@ -221,6 +255,7 @@ def _value_check(key, values_by_env, defined_in, present, config):
                 severity="error",
                 message=f"{key!r} has inconsistent value formats across environments: {reason}",
                 environments=present,
+                path=path,
             )
         )
 
@@ -233,6 +268,7 @@ def _value_check(key, values_by_env, defined_in, present, config):
                 severity="error" if key in config.required_keys else "warning",
                 message=f"{key!r} is empty in {', '.join(empty_in)}",
                 environments=present,
+                path=path,
             )
         )
     return findings
@@ -261,17 +297,25 @@ def scan(snapshots: list[EnvSnapshot], config: Config) -> list[EnvDrift]:
         required = key in config.required_keys or (
             key in config.required_in_prod and config.prod_env in names
         )
+        path = _anchor_path(snapshots, defined_in)
 
-        presence = _presence_check(key, defined_in, absent_in, present, required)
+        presence = _presence_check(key, defined_in, absent_in, present, required, path=path)
         if presence is not None:
             drifts.append(presence)
 
+        # A key commented out in one environment but still live in another is
+        # drift regardless of how many environments define it. This check used
+        # to sit behind `len(defined_in) < 2`, which skipped it for exactly the
+        # 3-environment case the README documents: `defined_in` had 2 entries,
+        # the guard fell through to `_value_check`, and `pending_removal` was
+        # never emitted even though the finding was true.
+        pending = _pending_removal(key, snapshots, values_by_env, defined_in, present, path=path)
+        if pending is not None:
+            drifts.append(pending)
+
         if len(defined_in) < 2:
-            pending = _pending_removal(key, snapshots, values_by_env, defined_in, present)
-            if pending is not None:
-                drifts.append(pending)
             continue
 
-        drifts.extend(_value_check(key, values_by_env, defined_in, present, config))
+        drifts.extend(_value_check(key, values_by_env, defined_in, present, config, path=path))
 
     return drifts

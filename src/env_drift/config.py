@@ -119,9 +119,14 @@ def _coerce(table: dict[str, object]) -> dict[str, object]:
 
 
 def _read_ignore_file(path: Path) -> tuple[str, ...]:
+    # UnicodeDecodeError is a ValueError, not an OSError, so listing only
+    # OSError let a non-UTF-8 .env-driftignore escape as a raw traceback. The
+    # process then exited 1 -- which the CLI documents as "drift detected" --
+    # so a corrupted ignore file reddened CI as if config had drifted. The
+    # decode is handled here exactly as _read_table already handles it.
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ConfigError(f"cannot read ignore file {path}: {exc}") from exc
     patterns = [
         line.strip()
