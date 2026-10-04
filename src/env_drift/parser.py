@@ -86,24 +86,41 @@ def _split_assignment(line: str) -> tuple[str, str] | None:
     return key, raw_value
 
 
+def _unfinished_quote_value(raw_stripped: str) -> bool:
+    """Return True if raw_stripped is a quoted value with no closing quote on the same line."""
+    if not raw_stripped:
+        return False
+    first_char = raw_stripped[0]
+    if first_char not in _QUOTES:
+        return False
+    # Count quotes in the stripped value; if odd → unclosed
+    return raw_stripped.count(first_char) % 2 == 1
+
+
 def parse_text(text: str) -> ParsedEnv:
     """Parse dotenv ``text`` into active values plus commented-out keys."""
     values: dict[str, str] = {}
     commented: list[str] = []
 
-    for raw_line in text.splitlines():
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw_line = raw_lines[i]
         line = raw_line.strip()
         if not line:
+            i += 1
             continue
 
         if line.startswith("#"):
             body = line.lstrip("#").strip()
             assignment = _split_assignment(body)
             if assignment is None:
+                i += 1
                 continue
             key = assignment[0]
             if key not in values and key not in commented:
                 commented.append(key)
+            i += 1
             continue
 
         for prefix in _EXPORT_PREFIXES:
@@ -113,13 +130,31 @@ def parse_text(text: str) -> ParsedEnv:
 
         assignment = _split_assignment(line)
         if assignment is None:
-            # Not an assignment (e.g. a stray "echo" line); ignore it.
+            i += 1
             continue
 
         key, raw_value = assignment
+        raw_stripped = raw_value.strip()
+
+        # Multi-line quoted value: accumulate lines until quote closes
+        if _unfinished_quote_value(raw_stripped):
+            quote_char = raw_stripped[0]
+            accumulator = [raw_stripped]
+            j = i + 1
+            while j < len(raw_lines):
+                next_raw = raw_lines[j].strip()
+                accumulator.append(next_raw)
+                # Close when we find a line that has at least one matching quote
+                if quote_char in next_raw:
+                    break
+                j += 1
+            # Rebuild raw_value from all accumulated lines
+            raw_value = "\n".join(accumulator)
+            i = j + 1
+        else:
+            i += 1
+
         values[key] = _clean_value(raw_value)
-        # A key that is commented out and then re-enabled below is active, so
-        # it must not linger in the pending-removal list.
         if key in commented:
             commented.remove(key)
 
