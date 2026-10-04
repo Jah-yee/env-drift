@@ -146,7 +146,10 @@ def _load(args: argparse.Namespace):
 
     files = discover_env_files(root, exclude=config.exclude_files)
     discovered = {f.name for f in files}
-    if getattr(args, "env", None):
+    if getattr(args, "env", None) and discovered:
+        # Only meaningful once something was found. With an empty `discovered`
+        # every --env name reads as "unknown", which hides the real problem
+        # (no env files at all) behind the clearer message below.
         wanted = set(args.env)
         unknown = sorted(wanted - discovered)
         if unknown:

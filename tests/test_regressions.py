@@ -308,3 +308,93 @@ def test_sarif_uri_of_a_nested_env_file_is_relative_to_the_root(tmp_path):
     for uri in uris:
         assert not uri.startswith("/")
         assert str(tmp_path) not in uri
+
+# --- scan --env must reject a name that matched no env file -----------------
+
+
+def _scan(tmp_path, *args):
+    return subprocess.run(
+        [sys.executable, "-m", "env_drift", "scan", *args],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_scan_env_typo_among_valid_names_exits_two(tmp_path):
+    """A misspelled --env must not silently narrow the scan.
+
+    ``developmnt`` matched no file, so it was dropped and only ``production``
+    survived. scan() needs two environments, returned [], and the CLI rendered
+    that as 'No drift detected' with exit 0 -- a drift scanner reporting clean
+    because of a typo in its own arguments. ``diff`` already raised UsageError
+    for the same name, so scan was the odd one out.
+    """
+    (tmp_path / ".env.development").write_text("A=1\nONLY_DEV=x\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n", encoding="utf-8")
+
+    result = _scan(tmp_path, "--env", "developmnt", "--env", "production")
+
+    assert result.returncode == 2, result.stdout
+    combined = (result.stderr + result.stdout).lower()
+    assert "unknown environment" in combined
+    assert "developmnt" in combined
+    assert "No drift detected" not in result.stdout
+
+
+def test_scan_env_typo_names_every_unknown_environment(tmp_path):
+    (tmp_path / ".env.development").write_text("A=1\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n", encoding="utf-8")
+
+    result = _scan(tmp_path, "--env", "developmnt", "--env", "prod")
+
+    assert result.returncode == 2
+    message = result.stderr + result.stdout
+    assert "developmnt" in message and "prod" in message
+    assert "unknown environments" in message.lower()
+
+
+def test_scan_env_all_names_valid_still_scans(tmp_path):
+    """The positive control: the fix must not deny every --env invocation.
+
+    ``DATABASE_URL`` is declared shared and diverges, which is an error-severity
+    finding -- the default threshold fails the run. A narrowing fix that quietly
+    scanned a single environment would return 0 here instead.
+    """
+    (tmp_path / ".env.development").write_text("DATABASE_URL=postgres://dev/app\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("DATABASE_URL=postgres://prod/app\n", encoding="utf-8")
+    (tmp_path / ".env-drift.toml").write_text(
+        '[env-drift]\nshared-keys = ["DATABASE_URL"]\n', encoding="utf-8"
+    )
+
+    result = _scan(tmp_path, "--env", "development", "--env", "production")
+
+    assert result.returncode == 1, result.stderr
+    assert "divergent_secret" in result.stdout
+    assert "DATABASE_URL" in result.stdout
+
+
+def test_scan_env_typo_is_rejected_in_every_output_format(tmp_path):
+    """JSON and SARIF consumers must not receive a truncated success payload."""
+    (tmp_path / ".env.development").write_text("A=1\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("A=1\n", encoding="utf-8")
+
+    for fmt in ("json", "sarif"):
+        result = _scan(tmp_path, "--format", fmt, "--env", "developmnt", "--env", "production")
+        assert result.returncode == 2, f"{fmt} returned {result.returncode}"
+        assert "unknown environment" in (result.stderr + result.stdout).lower()
+
+
+def test_scan_env_without_any_env_files_reports_the_missing_files(tmp_path):
+    """With nothing discovered every name would read as 'unknown'.
+
+    That hides the real problem behind a message about a name the user typed
+    correctly, so the pre-existing 'no .env files found' error must win.
+    """
+    result = _scan(tmp_path, "--env", "production")
+
+    assert result.returncode == 2
+    message = (result.stderr + result.stdout).lower()
+    assert "no .env files found" in message
+    assert "unknown environment" not in message
