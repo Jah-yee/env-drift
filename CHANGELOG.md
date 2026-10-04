@@ -33,6 +33,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `scan --env` no longer drops an environment name that matched no file. A
+  misspelling was filtered out silently, and because the check needs two
+  environments, the survivors were scanned alone, `scan()` returned nothing and
+  the CLI reported "No drift detected" with exit 0 -- a drift scanner reporting
+  clean because of a typo in its own arguments, in text and in JSON alike. An
+  unmatched name is now a usage error naming what was not found and what was
+  available, matching what `diff` already did. When no `.env` files exist at
+  all, the pre-existing "no .env files found" error is kept rather than
+  reporting every requested name as unknown
 - Masking keys off the variable name rather than the environment name, which
   leaked `SECRET_KEY` values in text and JSON output
 - `pending_removal` is no longer skipped once a key is live in two or more

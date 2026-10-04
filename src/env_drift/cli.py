@@ -145,8 +145,19 @@ def _load(args: argparse.Namespace):
         raise UsageError(str(exc)) from exc
 
     files = discover_env_files(root, exclude=config.exclude_files)
-    if getattr(args, "env", None):
+    discovered = {f.name for f in files}
+    if getattr(args, "env", None) and discovered:
+        # Only meaningful once something was found. With an empty `discovered`
+        # every --env name reads as "unknown", which hides the real problem
+        # (no env files at all) behind the clearer message below.
         wanted = set(args.env)
+        unknown = sorted(wanted - discovered)
+        if unknown:
+            available = ", ".join(sorted(discovered)) or "none"
+            raise UsageError(
+                f"unknown environment{'s' if len(unknown) > 1 else ''} "
+                f"{', '.join(repr(n) for n in unknown)}; discovered: {available}"
+            )
         files = [f for f in files if f.name in wanted]
     if not files:
         raise UsageError(f"no .env files found under {root}")
