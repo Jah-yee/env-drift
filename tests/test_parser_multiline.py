@@ -189,3 +189,39 @@ def test_multiline_value_replaces_a_previously_commented_key():
 
     assert result.values["KEY"] == "first\nsecond"
     assert "KEY" not in result.commented_keys
+
+
+def test_assignment_carrying_the_quote_char_is_not_absorbed():
+    """A line that is both an assignment and holds the quote char is a key.
+
+    The accumulation tested for the closing quote before asking whether the
+    line was an assignment, so this line was swallowed by whichever test ran
+    first::
+
+        A="x
+        B="y"          B looks like the closing quote, so A absorbed it
+
+    ``B`` then disappeared from the parse. That is the same key-loss the
+    continuation rule exists to prevent, reached through a different door.
+    """
+    result = parse_text('A="x\nB="y"\n')
+
+    assert "B" in result.values, (
+        f"the assignment carrying the closing quote was absorbed; got {result.values!r}"
+    )
+    assert result.values["B"] == "y"
+
+
+def test_key_survives_a_multiline_value_that_never_closes_before_it():
+    """The bounded scan stops at an assignment even inside an open quote.
+
+    ``A`` has no closing quote anywhere, but ``B`` is unambiguously its own
+    key. Refusing to continue is the safe direction: ``A`` keeps its literal
+    form, ``B`` is parsed.
+    """
+    result = parse_text('A="x\nB=plain\nC=2\n')
+
+    assert set(result.values) == {"A", "B", "C"}
+    assert result.values["A"] == '"x'
+    assert result.values["B"] == "plain"
+    assert result.values["C"] == "2"

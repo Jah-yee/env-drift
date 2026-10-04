@@ -160,6 +160,7 @@ def parse_text(text: str) -> ParsedEnv:
 
         assignment = _split_assignment(line)
         if assignment is None:
+            # Not an assignment (e.g. a stray "echo" line); ignore it.
             i += 1
             continue
 
@@ -175,24 +176,28 @@ def parse_text(text: str) -> ParsedEnv:
             j = i + 1
             while j < len(raw_lines):
                 next_line = raw_lines[j]
+                # Assignment check first. A line that is both an assignment and
+                # carries the quote char used to be absorbed by the quote test
+                # below, so ``A="x`` / ``B="y"`` collapsed into one value and
+                # key B vanished -- the key-loss this rule exists to prevent.
+                if not _is_continuation(next_line):
+                    break
                 # Stripped for the quote search only. The line itself is
                 # accumulated verbatim so the indentation inside the value
                 # survives; stripping it here rewrote ``"a\n    b"`` to
                 # ``"a\nb"``, changing the value the file actually declares.
-                if quote_char in next_line.strip():
-                    accumulator.append(next_line)
-                    j += 1
-                    break
-                if not _is_continuation(next_line):
-                    break
                 accumulator.append(next_line)
                 j += 1
+                if quote_char in next_line.strip():
+                    break
             raw_value = "\n".join(accumulator)
             i = j
         else:
             i += 1
 
         values[key] = _clean_value(raw_value)
+        # A key that is commented out and then re-enabled below is active, so
+        # it must not linger in the pending-removal list.
         if key in commented:
             commented.remove(key)
 
