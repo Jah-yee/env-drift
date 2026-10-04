@@ -86,15 +86,45 @@ def _split_assignment(line: str) -> tuple[str, str] | None:
     return key, raw_value
 
 
-def _unfinished_quote_value(raw_stripped: str) -> bool:
-    """Return True if raw_stripped is a quoted value with no closing quote on the same line."""
-    if not raw_stripped:
+def _is_unterminated(raw_stripped: str) -> bool:
+    """Return True if raw_stripped opens a quoted value that never closes.
+
+    The test is deliberately the same lookup :func:`_clean_value` performs --
+    "is there a closing quote at or after index 1?" -- rather than a parity count
+    of quote characters. Parity disagrees with that lookup on two ordinary
+    lines and each disagreement silently ate every following key::
+
+        KEY="v" # see "docs      3 quotes, odd  -> "unclosed", but _clean_value
+                                    closes at index 2 and returns ``v``
+        KEY="a \\" b"           3 quotes, odd  -> "unclosed", but the value
+                                    closes and the escaped quote is content
+
+    A false positive here is not a cosmetic misparse: the accumulation loop then
+    consumes the rest of the file looking for a quote that was never missing.
+    """
+    if not raw_stripped or raw_stripped[0] not in _QUOTES:
         return False
-    first_char = raw_stripped[0]
-    if first_char not in _QUOTES:
-        return False
-    # Count quotes in the stripped value; if odd → unclosed
-    return raw_stripped.count(first_char) % 2 == 1
+    return raw_stripped.find(raw_stripped[0], 1) == -1
+
+
+def _is_continuation(line: str) -> bool:
+    """Return True if `line` carries no key, so it can be part of a value.
+
+    The rule is exactly one thing: *does this line parse as an assignment?* If
+    not, it is absorbed into an open quoted value. Blank lines and comment lines
+    qualify -- inside an open quote a ``#`` line is content, and a certificate or
+    a commented block inside a value is ordinary.
+
+    Anything that parses as an assignment terminates the value instead, and is
+    left for the main loop. That bias is the whole point. Absorbing a real key
+    turns one stray quote into a *silent data loss* bug: every key after it
+    vanishes from the parse, and this tool's output is a comparison of key sets,
+    so the result is a report of keys "missing from development" that are
+    sitting right there in the file. Refusing to continue costs at most a
+    multi-line value whose body contains a bare ``KEY=value`` line, which is
+    ambiguous under any reading.
+    """
+    return _split_assignment(line.strip()) is None
 
 
 def parse_text(text: str) -> ParsedEnv:
@@ -136,21 +166,29 @@ def parse_text(text: str) -> ParsedEnv:
         key, raw_value = assignment
         raw_stripped = raw_value.strip()
 
-        # Multi-line quoted value: accumulate lines until quote closes
-        if _unfinished_quote_value(raw_stripped):
+        # Multi-line quoted value: the closing quote is not on this line, so the
+        # value spans physical lines. Accumulate until it closes -- or until a
+        # line arrives that must belong to the next key.
+        if _is_unterminated(raw_stripped):
             quote_char = raw_stripped[0]
             accumulator = [raw_stripped]
             j = i + 1
             while j < len(raw_lines):
-                next_raw = raw_lines[j].strip()
-                accumulator.append(next_raw)
-                # Close when we find a line that has at least one matching quote
-                if quote_char in next_raw:
+                next_line = raw_lines[j]
+                # Stripped for the quote search only. The line itself is
+                # accumulated verbatim so the indentation inside the value
+                # survives; stripping it here rewrote ``"a\n    b"`` to
+                # ``"a\nb"``, changing the value the file actually declares.
+                if quote_char in next_line.strip():
+                    accumulator.append(next_line)
+                    j += 1
                     break
+                if not _is_continuation(next_line):
+                    break
+                accumulator.append(next_line)
                 j += 1
-            # Rebuild raw_value from all accumulated lines
             raw_value = "\n".join(accumulator)
-            i = j + 1
+            i = j
         else:
             i += 1
 
